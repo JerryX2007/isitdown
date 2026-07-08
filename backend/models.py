@@ -1,7 +1,10 @@
 from pydantic import BaseModel, Field
 
 class Monitor(BaseModel):
-    name: str = Field(min_length=1)
-    target: str = Field(min_length=1)
-    port: int = Field(gt=0, lt=65536, default=80)
+    website: str = Field(min_length=1)
+    name: str | None = None
+    timeout: float = Field(gt=0, default=3.0)
+
+class TempCheck(BaseModel):
+    website: str = Field(min_length=1)
     timeout: float = Field(gt=0, default=3.0)
