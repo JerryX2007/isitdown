@@ -1,6 +1,7 @@
 import sqlite3
+from pathlib import Path
 
-DATABASE = "monitor.db"
+DATABASE = Path(__file__).with_name("monitor.db")
 
 def get_db():
     conn = sqlite3.connect(DATABASE)
@@ -10,41 +11,24 @@ def get_db():
 
 def init_db():
     conn = get_db()
-    conn.execute('''CREATE TABLE IF NOT EXISTS monitors (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 owner_type TEXT CHECK(owner_type IN ('guest', 'user')) NOT NULL,
-                 owner_id TEXT NOT NULL,
-                 name TEXT NOT NULL,
-                 target TEXT NOT NULL,
-                 port INTEGER CHECK (port > 0 AND port < 65536) NOT NULL,
-                 timeout REAL CHECK (timeout > 0) NOT NULL,
-                 check_type TEXT CHECK(check_type IN ('https', 'http', 'dns', 'tcp')) NOT NULL DEFAULT 'https',
-                 status TEXT,
-                 latency REAL,
-                 last_checked TEXT,
-                 last_error TEXT,
-                 UNIQUE(owner_type, owner_id, target, port, check_type))''')
     conn.execute('''CREATE TABLE IF NOT EXISTS check_history (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 monitor_id INTEGER NOT NULL,
-                 status TEXT CHECK (status IN ('online', 'offline')) NOT NULL,
+                 target TEXT NOT NULL,
+                 status TEXT CHECK(status IN ('up', 'issues', 'down')) NOT NULL,
                  latency REAL,
+                 status_code INTEGER,
                  checked_at TEXT NOT NULL,
-                 last_error TEXT,
-                 FOREIGN KEY(monitor_id) REFERENCES monitors(id))''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS incidents (
+                 error TEXT)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS outage_reports (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 monitor_id INTEGER NOT NULL,
-                 started_at TEXT NOT NULL,
-                 resolved_at TEXT,
-                 duration REAL,
-                 status TEXT CHECK (status IN ('ongoing', 'resolved')) NOT NULL,
-                 FOREIGN KEY(monitor_id) REFERENCES monitors(id))''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS popular_checks (
-                target TEXT PRIMARY KEY,
-                total_checks INTEGER NOT NULL DEFAULT 0,
-                last_checked TEXT,
-                last_status TEXT CHECK(last_status IN ('online', 'offline')),
-                last_latency REAL)''')
+                 target TEXT NOT NULL,
+                 reporter_hash TEXT NOT NULL,
+                 created_at TEXT NOT NULL)''')
+    conn.execute('''CREATE INDEX IF NOT EXISTS check_history_target_time_idx
+                 ON check_history(target, checked_at)''')
+    conn.execute('''CREATE INDEX IF NOT EXISTS outage_reports_target_time_idx
+                 ON outage_reports(target, created_at)''')
+    conn.execute('''CREATE INDEX IF NOT EXISTS outage_reports_rate_limit_idx
+                 ON outage_reports(target, reporter_hash, created_at)''')
     conn.commit()
     conn.close()

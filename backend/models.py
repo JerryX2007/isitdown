@@ -1,10 +1,8 @@
 from pydantic import BaseModel, Field
 
 class Monitor(BaseModel):
-    website: str = Field(min_length=1)
-    name: str | None = None
-    timeout: float = Field(gt=0, default=3.0)
+    website: str = Field(min_length=1, max_length=500)
+    timeout: float = Field(gt=0, le=15, default=7.0)
 
-class TempCheck(BaseModel):
-    website: str = Field(min_length=1)
-    timeout: float = Field(gt=0, default=3.0)
+class OutageReport(BaseModel):
+    reporter_id: str = Field(min_length=8, max_length=100)

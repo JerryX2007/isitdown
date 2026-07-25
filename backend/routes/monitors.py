@@ -1,444 +1,322 @@
-from fastapi import Header, APIRouter, HTTPException, Depends
-from datetime import datetime
+from fastapi import APIRouter, HTTPException, Query
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
-import sqlite3
+from hashlib import sha256
+from ipaddress import ip_address
 import socket
 import time
+import httpx
 
 from database import get_db
-from models import Monitor, TempCheck
+from models import Monitor, OutageReport
 
-router = APIRouter()
+router = APIRouter(prefix="/api", tags=["website status"])
 
-def current_timestamp():
-    return time.strftime("%Y-%m-%d %H:%M:%S")
+def utc_now():
+    return datetime.now(timezone.utc)
 
-def find_monitor(monitor_id: int, owner: dict):
-    conn = get_db()
-    cursor = conn.execute(
-        """
-        SELECT * FROM monitors
-        WHERE id = ? AND owner_type = ? AND owner_id = ?
-        """,
-        (monitor_id, owner["owner_type"], owner["owner_id"]),
-    )
-    monitor = cursor.fetchone()
-    conn.close()
+def utc_timestamp():
+    return utc_now().isoformat().replace("+00:00", "Z")
 
-    if monitor:
-        return dict(monitor)
+def get_public_addresses(target: str):
+    try:
+        address_info = socket.getaddrinfo(target, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return []
 
-    return None
+    addresses = {entry[4][0] for entry in address_info}
+
+    for address in addresses:
+        parsed_address = ip_address(address)
+        if (
+            parsed_address.is_private
+            or parsed_address.is_loopback
+            or parsed_address.is_link_local
+            or parsed_address.is_reserved
+            or parsed_address.is_multicast
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Private or local network addresses cannot be checked.",
+            )
+
+    return list(addresses)
 
 def normalize_website(raw_website: str):
     value = raw_website.strip()
 
     if not value:
-        raise HTTPException(status_code=400, detail="Website cannot be empty")
+        raise HTTPException(status_code=400, detail="Enter a website to check.")
 
-    has_scheme = "://" in value
-    parsed = urlparse(value if has_scheme else f"https://{value}")
-
+    parsed = urlparse(value if "://" in value else f"https://{value}")
     scheme = parsed.scheme.lower()
+
     if scheme not in ("http", "https"):
-        scheme = "https"
+        raise HTTPException(
+            status_code=400,
+            detail="Only HTTP and HTTPS websites can be checked.",
+        )
 
-    target = parsed.hostname
-    if not target:
-        raise HTTPException(status_code=400, detail="Invalid website or domain")
+    if parsed.username or parsed.password or parsed.port:
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a website without login details or a custom port.",
+        )
 
-    target = target.lower()
-    default_port = 443 if scheme == "https" else 80
+    if not parsed.hostname:
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid website, such as example.com.",
+        )
 
     try:
-        port = parsed.port or default_port
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid port")
+        target = parsed.hostname.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError as error:
+        raise HTTPException(status_code=400, detail="Invalid website address.") from error
 
-    if port <= 0 or port >= 65536:
-        raise HTTPException(status_code=400, detail="Port must be between 1 and 65535")
+    if target == "localhost" or target.endswith(".local") or "." not in target:
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a public website address.",
+        )
 
     return {
         "target": target,
-        "port": port,
-        "check_type": scheme,
+        "scheme": scheme,
+        "url": f"{scheme}://{target}",
     }
 
-def get_owner(x_guest_id: str | None = Header(default=None)):
-    if not x_guest_id:
-        raise HTTPException(status_code=400, detail="Missing guest ID")
+def check_target(website: str, timeout: float):
+    normalized = normalize_website(website)
+    target = normalized["target"]
+    addresses = get_public_addresses(target)
+    checked_at = utc_timestamp()
+
+    if not addresses:
+        return {
+            "target": target,
+            "status": "down",
+            "latency": None,
+            "status_code": None,
+            "checked_at": checked_at,
+            "error": "DNS lookup failed.",
+        }
+
+    urls = [normalized["url"]]
+    if normalized["scheme"] == "https":
+        urls.append(f"http://{target}")
+
+    last_error = "The website did not respond."
+
+    with httpx.Client(
+        follow_redirects=True,
+        timeout=httpx.Timeout(timeout),
+        headers={
+            "User-Agent": "WebsiteStatusChecker/1.0",
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    ) as client:
+        for url in urls:
+            started_at = time.perf_counter()
+
+            try:
+                response = client.head(url)
+                if response.status_code == 405:
+                    response = client.get(url, headers={"Range": "bytes=0-0"})
+
+                latency = round((time.perf_counter() - started_at) * 1000, 2)
+                status = "issues" if response.status_code >= 500 else "up"
+
+                return {
+                    "target": target,
+                    "status": status,
+                    "latency": latency,
+                    "status_code": response.status_code,
+                    "checked_at": checked_at,
+                    "error": None,
+                }
+            except httpx.TimeoutException:
+                last_error = "The connection timed out."
+            except httpx.HTTPError:
+                last_error = "We could not connect to this website."
+
     return {
-        "owner_type": "guest",
-        "owner_id": x_guest_id
+        "target": target,
+        "status": "down",
+        "latency": None,
+        "status_code": None,
+        "checked_at": checked_at,
+        "error": last_error,
     }
 
-def check_target(target: str, port: int, timeout: float, check_type: str):
-    start_time = time.perf_counter()
-
-    try:
-        socket.getaddrinfo(target, port, type=socket.SOCK_STREAM)
-
-        with socket.create_connection((target, port), timeout=timeout):
-            pass
-
-        end_time = time.perf_counter()
-        latency = round((end_time - start_time) * 1000, 2)
-
-        return {
-            "target": target,
-            "port": port,
-            "check_type": check_type,
-            "status": "online",
-            "latency": latency,
-            "last_error": None,
-        }
-
-    except socket.gaierror:
-        return {
-            "target": target,
-            "port": port,
-            "check_type": check_type,
-            "status": "offline",
-            "latency": None,
-            "last_error": "DNS lookup failed",
-        }
-
-    except socket.timeout:
-        return {
-            "target": target,
-            "port": port,
-            "check_type": check_type,
-            "status": "offline",
-            "latency": None,
-            "last_error": "Connection timed out",
-        }
-
-    except socket.error as e:
-        return {
-            "target": target,
-            "port": port,
-            "check_type": check_type,
-            "status": "offline",
-            "latency": None,
-            "last_error": str(e),
-        }
-
-def record_popular_check(conn, target: str, status: str, latency: float | None, checked_at: str):
-    conn.execute(
+def record_check(result: dict):
+    connection = get_db()
+    connection.execute(
         """
-        INSERT INTO popular_checks
-        (target, total_checks, last_checked, last_status, last_latency)
-        VALUES (?, 1, ?, ?, ?)
-        ON CONFLICT(target) DO UPDATE SET
-            total_checks = total_checks + 1,
-            last_checked = excluded.last_checked,
-            last_status = excluded.last_status,
-            last_latency = excluded.last_latency
+        INSERT INTO check_history
+        (target, status, latency, status_code, checked_at, error)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (target, checked_at, status, latency),
+        (
+            result["target"],
+            result["status"],
+            result["latency"],
+            result["status_code"],
+            result["checked_at"],
+            result["error"],
+        ),
     )
+    connection.commit()
+    connection.close()
+
+def create_empty_timeline(selected_range: str):
+    now = utc_now()
+
+    if selected_range == "7d":
+        end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return [
+            {
+                "key": (end - timedelta(days=6 - index)).strftime("%Y-%m-%d"),
+                "count": 0,
+            }
+            for index in range(7)
+        ]
+
+    end = now.replace(minute=0, second=0, microsecond=0)
+    return [
+        {
+            "key": (end - timedelta(hours=23 - index)).strftime(
+                "%Y-%m-%dT%H:00:00Z"
+            ),
+            "count": 0,
+        }
+        for index in range(24)
+    ]
 
 #GET ENDPOINTS
 
-@router.get("/popular")
-def get_popular_websites():
-    conn = get_db()
-    rows = conn.execute(
-        """
-        SELECT target, total_checks, last_checked, last_status, last_latency
-        FROM popular_checks
-        ORDER BY total_checks DESC, target ASC
-        LIMIT 10
-        """
-    ).fetchall()
-    conn.close()
-
-    return [dict(row) for row in rows]
-
-@router.get("/monitors")
-def get_monitors(owner=Depends(get_owner)):
-    conn = get_db()
-    cursor = conn.execute(
-        """
-        SELECT * FROM monitors
-        WHERE owner_type = ? AND owner_id = ?
-        ORDER BY id DESC
-        """,
-        (owner["owner_type"], owner["owner_id"]),
+@router.get("/status/{target}/history")
+def get_outage_history(target: str, selected_range: str = Query(default="24h", alias="range", pattern="^(24h|7d)$")):
+    normalized = normalize_website(target)
+    clean_target = normalized["target"]
+    timeline = create_empty_timeline(selected_range)
+    bucket_format = (
+        "%Y-%m-%d"
+        if selected_range == "7d"
+        else "%Y-%m-%dT%H:00:00Z"
     )
-    rows = cursor.fetchall()
-    conn.close()
+    since = "-7 days" if selected_range == "7d" else "-24 hours"
 
-    return [dict(row) for row in rows]
-
-@router.get("/monitors/{monitor_id}")
-def read_monitor(monitor_id: int, owner=Depends(get_owner)):
-    monitor = find_monitor(monitor_id, owner)
-
-    if monitor:
-        return monitor
-
-    raise HTTPException(status_code=404, detail="Monitor not found")
-
-@router.get("/monitors/{monitor_id}/history")
-def get_monitor_history(monitor_id: int, owner = Depends(get_owner)):
-    monitor = find_monitor(monitor_id, owner)
-    if not monitor:
-        raise HTTPException(status_code=404, detail="Monitor not found")
-    conn = get_db()
-    cursor = conn.execute("SELECT * FROM check_history WHERE monitor_id = ? ORDER BY id DESC", (monitor_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
-
-@router.get("/monitors/{monitor_id}/stats")
-def get_monitor_stats(monitor_id: int, owner = Depends(get_owner)):
-    monitor = find_monitor(monitor_id, owner)
-    if not monitor:
-        raise HTTPException(status_code=404, detail="Monitor not found")
-    conn = get_db()
-    cursor = conn.execute(
-        """
+    connection = get_db()
+    report_rows = connection.execute(
+        f"""
         SELECT
-        COUNT(*) AS total_checks,
-        COALESCE(SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END), 0) AS online_checks,
-        COALESCE(SUM(CASE WHEN status = 'offline' THEN 1 ELSE 0 END), 0) AS offline_checks,
-        AVG(latency) AS avg_latency
-        FROM check_history
-        WHERE monitor_id = ?
+            strftime('{bucket_format}', datetime(created_at)) AS bucket,
+            COUNT(*) AS report_count
+        FROM outage_reports
+        WHERE target = ?
+          AND datetime(created_at) >= datetime('now', ?)
+        GROUP BY bucket
+        ORDER BY bucket ASC
         """,
-        (monitor_id,)
-    )
-    stats = dict(cursor.fetchone())
-    conn.close()
-
-    up = stats["online_checks"]
-    total = stats["total_checks"]
-    stats["uptime_percentage"] = round((up / total) * 100, 2) if total > 0 else None
-
-    return stats
-
-@router.get("/monitors/{monitor_id}/incidents")
-def get_monitor_incidents(monitor_id: int, owner = Depends(get_owner)):
-    monitor = find_monitor(monitor_id, owner)
-    if not monitor:
-        raise HTTPException(status_code=404, detail="Monitor not found")
-    conn = get_db()
-    rows = conn.execute(
-        """
-        SELECT * FROM incidents
-        WHERE monitor_id = ?
-        ORDER BY id DESC
-        """,
-        (monitor_id,)
+        (clean_target, since),
     ).fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
+
+    summary = dict(
+        connection.execute(
+            """
+            SELECT
+                COUNT(*) AS reports_in_range,
+                COALESCE(SUM(
+                    CASE
+                        WHEN datetime(created_at) >= datetime('now', '-1 hour')
+                        THEN 1 ELSE 0
+                    END
+                ), 0) AS reports_last_hour,
+                COALESCE(SUM(
+                    CASE
+                        WHEN datetime(created_at) >= datetime('now', '-15 minutes')
+                        THEN 1 ELSE 0
+                    END
+                ), 0) AS reports_last_15_minutes,
+                MAX(created_at) AS last_reported_at
+            FROM outage_reports
+            WHERE target = ?
+              AND datetime(created_at) >= datetime('now', ?)
+            """,
+            (clean_target, since),
+        ).fetchone()
+    )
+
+    latest_check_row = connection.execute(
+        """
+        SELECT status, latency, status_code, checked_at, error
+        FROM check_history
+        WHERE target = ?
+        ORDER BY datetime(checked_at) DESC
+        LIMIT 1
+        """,
+        (clean_target,),
+    ).fetchone()
+    connection.close()
+
+    counts = {row["bucket"]: row["report_count"] for row in report_rows}
+    for point in timeline:
+        point["count"] = counts.get(point["key"], 0)
+
+    return {
+        "target": clean_target,
+        "range": selected_range,
+        "points": timeline,
+        "summary": summary,
+        "latest_check": dict(latest_check_row) if latest_check_row else None,
+    }
 
 #POST ENDPOINTS
 
-@router.post("/check-once")
-def check_url(request: TempCheck):
-    normalized = normalize_website(request.website)
-    result = check_target(
-        normalized["target"],
-        normalized["port"],
-        request.timeout,
-        normalized["check_type"],
-    )
-
-    checked_at = current_timestamp()
-    result["checked_at"] = checked_at
-
-    conn = get_db()
-    record_popular_check(conn, result["target"], result["status"], result["latency"], checked_at)
-    conn.commit()
-    conn.close()
-
+@router.post("/check")
+def check_website(request: Monitor):
+    result = check_target(request.website, request.timeout)
+    record_check(result)
     return result
 
-@router.post("/monitors")
-def add_monitor(monitor: Monitor, owner=Depends(get_owner)):
-    normalized = normalize_website(monitor.website)
-    monitor_name = monitor.name.strip() if monitor.name and monitor.name.strip() else normalized["target"]
+@router.post("/status/{target}/report", status_code=201)
+def report_outage(target: str, report: OutageReport):
+    normalized = normalize_website(target)
+    clean_target = normalized["target"]
+    reporter_hash = sha256(
+        f"{clean_target}:{report.reporter_id}".encode("utf-8")
+    ).hexdigest()
 
-    conn = get_db()
+    connection = get_db()
+    existing_report = connection.execute(
+        """
+        SELECT id
+        FROM outage_reports
+        WHERE target = ?
+          AND reporter_hash = ?
+          AND datetime(created_at) >= datetime('now', '-1 hour')
+        LIMIT 1
+        """,
+        (clean_target, reporter_hash),
+    ).fetchone()
 
-    try:
-        cursor = conn.execute(
-            """
-            INSERT INTO monitors
-            (owner_type, owner_id, name, target, port, timeout, check_type, status, latency, last_checked, last_error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                owner["owner_type"],
-                owner["owner_id"],
-                monitor_name,
-                normalized["target"],
-                normalized["port"],
-                monitor.timeout,
-                normalized["check_type"],
-                None,
-                None,
-                None,
-                None,
-            ),
+    if existing_report:
+        connection.close()
+        raise HTTPException(
+            status_code=409,
+            detail="You already reported an issue with this website recently.",
         )
-        conn.commit()
-        monitor_id = cursor.lastrowid
 
-        row = conn.execute(
-            "SELECT * FROM monitors WHERE id = ?",
-            (monitor_id,),
-        ).fetchone()
-
-        return dict(row)
-
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="You already saved this website")
-
-    finally:
-        conn.close()
-
-@router.post("/monitors/{monitor_id}/check")
-def check_monitor(monitor_id: int, owner = Depends(get_owner)):
-    monitor = find_monitor(monitor_id, owner)
-    if not monitor:
-        raise HTTPException(status_code=404, detail="Monitor not found")
-    result = check_target(
-        monitor["target"],
-        monitor["port"],
-        monitor["timeout"],
-        monitor["check_type"],
+    created_at = utc_timestamp()
+    connection.execute(
+        """
+        INSERT INTO outage_reports (target, reporter_hash, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (clean_target, reporter_hash, created_at),
     )
-    checked_at = current_timestamp()
-    result["checked_at"] = checked_at
-    conn = get_db()
+    connection.commit()
+    connection.close()
 
-    try:
-        latest_incident = conn.execute(
-            """
-            SELECT * FROM incidents
-            WHERE monitor_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (monitor_id,),
-        ).fetchone()
-        if result["status"] == "offline":
-            if not latest_incident or latest_incident["status"] != "ongoing":
-                conn.execute(
-                    """
-                    INSERT INTO incidents
-                    (monitor_id, started_at, status)
-                    VALUES (?, ?, ?)
-                    """,
-                    (monitor_id, checked_at, "ongoing"),
-                )
-        if result["status"] == "online" and latest_incident and latest_incident["status"] == "ongoing":
-            duration = (
-                datetime.strptime(checked_at, "%Y-%m-%d %H:%M:%S")
-                - datetime.strptime(latest_incident["started_at"], "%Y-%m-%d %H:%M:%S")
-            ).total_seconds()
-
-            conn.execute(
-                """
-                UPDATE incidents
-                SET resolved_at = ?, duration = ?, status = ?
-                WHERE id = ?
-                """,
-                (checked_at, duration, "resolved", latest_incident["id"]),
-            )
-
-        conn.execute(
-            """
-            UPDATE monitors
-            SET status = ?, latency = ?, last_checked = ?, last_error = ?
-            WHERE id = ?
-            """,
-            (result["status"], result["latency"], checked_at, result["last_error"], monitor_id),
-        )
-
-        cursor = conn.execute(
-            """
-            INSERT INTO check_history
-            (monitor_id, status, latency, checked_at, last_error)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (monitor_id, result["status"], result["latency"], checked_at, result["last_error"]),
-        )
-
-        record_popular_check(conn, result["target"], result["status"], result["latency"], checked_at)
-
-        conn.commit()
-        recent_check_id = cursor.lastrowid
-
-        row = conn.execute(
-            "SELECT * FROM check_history WHERE id = ?",
-            (recent_check_id,),
-        ).fetchone()
-
-        return dict(row)
-    finally:
-        conn.close()
-
-#DELETE ENDPOINTS
-
-@router.delete("/monitors/{monitor_id}")
-def delete_monitor(monitor_id: int, owner = Depends(get_owner)):
-    monitor = find_monitor(monitor_id, owner)
-    if not monitor:
-        raise HTTPException(status_code=404, detail="Monitor not found")
-    conn = get_db()
-    conn.execute("DELETE FROM check_history WHERE monitor_id = ?", (monitor_id,))
-    conn.execute("DELETE FROM incidents WHERE monitor_id = ?", (monitor_id,))
-    conn.execute("DELETE FROM monitors WHERE id = ?", (monitor_id,))
-    conn.commit()
-    conn.close()
-    return {"message": "Monitor deleted"}
-
-#PUT ENDPOINTS
-
-@router.put("/monitors/{monitor_id}")
-def update_monitor(monitor_id: int, monitor: Monitor, owner=Depends(get_owner)):
-    existing_monitor = find_monitor(monitor_id, owner)
-
-    if not existing_monitor:
-        raise HTTPException(status_code=404, detail="Monitor not found")
-
-    normalized = normalize_website(monitor.website)
-    monitor_name = monitor.name.strip() if monitor.name and monitor.name.strip() else normalized["target"]
-
-    conn = get_db()
-
-    try:
-        conn.execute(
-            """
-            UPDATE monitors
-            SET name = ?, target = ?, port = ?, timeout = ?, check_type = ?
-            WHERE id = ?
-            """,
-            (
-                monitor_name,
-                normalized["target"],
-                normalized["port"],
-                monitor.timeout,
-                normalized["check_type"],
-                monitor_id,
-            ),
-        )
-        conn.commit()
-
-        row = conn.execute(
-            "SELECT * FROM monitors WHERE id = ?",
-            (monitor_id,),
-        ).fetchone()
-
-        return dict(row)
-
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="You already saved this website")
-
-    finally:
-        conn.close()
+    return {"accepted": True, "created_at": created_at}

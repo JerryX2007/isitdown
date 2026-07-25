@@ -2,21 +2,23 @@ from fastapi import FastAPI
 from database import init_db
 from routes.monitors import router as monitors_router
 from fastapi.middleware.cors import CORSMiddleware
+import os
 
-app = FastAPI()
+app = FastAPI(title="Is My Website Down API", version="1.0.0")
+
+allowed_origins = os.getenv("FRONTEND_ORIGINS", "http://localhost:5173, http://127.0.0.1:5173").split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[origin.strip() for origin in allowed_origins],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
 init_db()
-
-@app.get("/")
-def home():
-    return {"message": "Network Status Monitor API is running!!"}
-
 app.include_router(monitors_router)
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}

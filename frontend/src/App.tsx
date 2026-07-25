@@ -1,312 +1,652 @@
-import { useEffect, useState, type FormEvent } from 'react'
-import './App.css'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type FormEvent,
+} from "react";
+import {
+  Link,
+  Navigate,
+  Route,
+  Routes,
+  useNavigate,
+  useParams,
+} from "react-router-dom";
 
-const API_BASE = "http://127.0.0.1:8000";
 
-type Monitor = {
-  id: number;
-  name: string;
-  target: string;
-  port: number;
-  timeout: number;
-  check_type: string;
-  status: string | null;
-  latency: number | null;
-  last_checked: string | null;
-  last_error: string | null;
-};
+const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8000";
+const EXAMPLE_SITES = ["github.com", "spotify.com", "discord.com"];
+
+type SiteStatus = "up" | "issues" | "down";
+type HistoryRange = "24h" | "7d";
 
 type CheckResult = {
   target: string;
-  port: number;
-  check_type: string;
-  status: string;
+  status: SiteStatus;
   latency: number | null;
-  last_error: string | null;
+  status_code: number | null;
   checked_at: string;
+  error: string | null;
 };
 
-type PopularSite = {
+type HistoryData = {
   target: string;
-  total_checks: number;
-  last_checked: string | null;
-  last_status: string | null;
-  last_latency: number | null;
+  range: HistoryRange;
+  points: Array<{ key: string; count: number }>;
+  summary: {
+    reports_in_range: number;
+    reports_last_hour: number;
+    reports_last_15_minutes: number;
+    last_reported_at: string | null;
+  };
+  latest_check: CheckResult | null;
 };
 
-function getGuestId() {
-  let guestId = localStorage.getItem("guestId");
+const STATUS_COPY = {
+  up: {
+    title: "is up",
+    detail: "The website responded normally to a fresh availability check.",
+  },
+  issues: {
+    title: "may be having issues",
+    detail: "The website responded, but its server returned an error.",
+  },
+  down: {
+    title: "appears to be down",
+    detail: "We could not get a response from the website.",
+  },
+};
 
-  if (!guestId) {
-    guestId = crypto.randomUUID();
-    localStorage.setItem("guestId", guestId);
+function normalizeWebsite(rawValue: string) {
+  const value = rawValue.trim();
+  if (!value) throw new Error("Enter a website to check.");
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value.includes("://") ? value : `https://${value}`);
+  } catch {
+    throw new Error("Enter a valid website, such as example.com.");
   }
 
-  return guestId;
+  const target = parsed.hostname.toLowerCase().replace(/\.$/, "");
+  if (!target || target === "localhost" || !target.includes(".")) {
+    throw new Error("Enter a public website address.");
+  }
+
+  return target;
 }
 
-function guestHeaders() {
-  return {
-    "X-Guest-Id": getGuestId(),
-  };
+function displayTarget(target: string) {
+  return target.replace(/^www\./, "");
 }
 
-function statusLabel(status: string | null) {
-  if (!status) return "Not checked";
-  return status === "online" ? "Online" : "Offline";
+function relativeTime(value: string | null) {
+  if (!value) return "No reports yet";
+
+  const elapsed = Date.now() - new Date(value).getTime();
+  const minutes = Math.max(0, Math.floor(elapsed / 60_000));
+
+  if (minutes < 1) return "Just now";
+  if (minutes < 60) return `${minutes} min ago`;
+
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hr ago`;
+
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
 }
 
-function App() {
-  const [monitors, setMonitors] = useState<Monitor[]>([]);
-  const [popularSites, setPopularSites] = useState<PopularSite[]>([]);
+function getReporterId() {
+  const storageKey = "website-outage-reporter-id";
+  let reporterId = localStorage.getItem(storageKey);
+
+  if (!reporterId) {
+    reporterId = `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random()
+      .toString(36)
+      .slice(2)}`;
+    localStorage.setItem(storageKey, reporterId);
+  }
+
+  return reporterId;
+}
+
+function Brand({ small = false }: { small?: boolean }) {
+  return (
+    <Link className={`brand${small ? " brand-small" : ""}`} to="/">
+      <span className="brand-mark" aria-hidden="true">
+        <i />
+        <i />
+        <i />
+      </span>
+      <span>
+        isit<span>down</span>
+      </span>
+    </Link>
+  );
+}
+
+function SearchIcon() {
+  return <span className="search-icon" aria-hidden="true" />;
+}
+
+function HomePage() {
+  const navigate = useNavigate();
   const [website, setWebsite] = useState("");
-  const [monitorName, setMonitorName] = useState("");
-  const [result, setResult] = useState<CheckResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [isChecking, setIsChecking] = useState(false);
+  const [error, setError] = useState("");
 
-  async function loadMonitors() {
-    const response = await fetch(`${API_BASE}/monitors`, {
-      headers: guestHeaders(),
-    });
-
-    const data = await response.json();
-    setMonitors(data);
-  }
-
-  async function loadPopularSites() {
-    const response = await fetch(`${API_BASE}/popular`);
-    const data = await response.json();
-    setPopularSites(data);
-  }
-
-  useEffect(() => {
-    loadMonitors();
-    loadPopularSites();
-  }, []);
-
-  async function checkOnce(event: FormEvent) {
+  function submitWebsite(event: FormEvent) {
     event.preventDefault();
-    setError(null);
-    setResult(null);
-    setIsChecking(true);
+    setError("");
 
     try {
-      const response = await fetch(`${API_BASE}/check-once`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          website,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.detail ?? "Could not check website");
-      }
-
-      setResult(data);
-      loadPopularSites();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong");
-    } finally {
-      setIsChecking(false);
+      const target = normalizeWebsite(website);
+      navigate(`/status/${encodeURIComponent(target)}`);
+    } catch (inputError) {
+      setError(
+        inputError instanceof Error
+          ? inputError.message
+          : "Enter a valid website.",
+      );
     }
-  }
-
-  async function saveMonitor() {
-    setError(null);
-
-    try {
-      const response = await fetch(`${API_BASE}/monitors`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...guestHeaders(),
-        },
-        body: JSON.stringify({
-          website,
-          name: monitorName || undefined,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.detail ?? "Could not save monitor");
-      }
-
-      setMonitors((prevMonitors) => [data, ...prevMonitors]);
-      setMonitorName("");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong");
-    }
-  }
-
-  async function checkMonitor(id: number) {
-    const response = await fetch(`${API_BASE}/monitors/${id}/check`, {
-      method: "POST",
-      headers: guestHeaders(),
-    });
-
-    const result = await response.json();
-
-    setMonitors((prevMonitors) =>
-      prevMonitors.map((monitor) =>
-        monitor.id === id
-          ? {
-              ...monitor,
-              status: result.status,
-              latency: result.latency,
-              last_checked: result.checked_at,
-              last_error: result.last_error,
-            }
-          : monitor
-      )
-    );
-
-    loadPopularSites();
-  }
-
-  async function deleteMonitor(id: number) {
-    await fetch(`${API_BASE}/monitors/${id}`, {
-      method: "DELETE",
-      headers: guestHeaders(),
-    });
-
-    setMonitors((prevMonitors) => prevMonitors.filter((monitor) => monitor.id !== id));
   }
 
   return (
-    <main className="app-shell">
-      <section className="hero-card">
-        <p className="eyebrow">Website status checker</p>
-        <h1>Is this website down?</h1>
-        <p className="hero-subtitle">
-          Enter a domain and I’ll automatically check the right connection for you.
+    <main className="page-shell">
+      <header className="site-header">
+        <Brand />
+        <span className="header-note">No account required</span>
+      </header>
+
+      <section className="home-hero">
+        <p className="eyebrow">
+          <span className="live-dot" />
+          Live website status
+        </p>
+        <h1>
+          Is it down for everyone
+          <br />
+          <span>or just you?</span>
+        </h1>
+        <p className="hero-copy">
+          Check any website in seconds, see recent outage reports, and find out
+          if other people are having the same problem.
         </p>
 
-        <form className="check-form" onSubmit={checkOnce}>
-          <input
-            value={website}
-            onChange={(e) => setWebsite(e.target.value)}
-            placeholder="google.com"
-          />
-          <button type="submit" disabled={isChecking || website.trim() === ""}>
-            {isChecking ? "Checking..." : "Check now"}
+        <form className="domain-form" onSubmit={submitWebsite}>
+          <label className="domain-input">
+            <SearchIcon />
+            <input
+              aria-label="Website address"
+              autoCapitalize="none"
+              autoComplete="url"
+              autoCorrect="off"
+              onChange={(event) => {
+                setWebsite(event.target.value);
+                setError("");
+              }}
+              placeholder="Enter a website, e.g. google.com"
+              spellCheck={false}
+              value={website}
+            />
+          </label>
+          <button className="primary-button" type="submit">
+            Check status <span aria-hidden="true">→</span>
           </button>
         </form>
 
-        <div className="save-row">
-          <input
-            value={monitorName}
-            onChange={(e) => setMonitorName(e.target.value)}
-            placeholder="Optional tracker name"
-          />
-          <button type="button" onClick={saveMonitor} disabled={website.trim() === ""}>
-            Save tracker
-          </button>
-        </div>
-
-        {error && <p className="error-message">{error}</p>}
-
-        {result && (
-          <div className={`result-card ${result.status}`}>
-            <div>
-              <p className="result-target">{result.target}</p>
-              <p className="result-meta">
-                {result.check_type.toUpperCase()} on port {result.port} · Checked {result.checked_at}
-              </p>
-            </div>
-            <div className="result-status">
-              <span>{statusLabel(result.status)}</span>
-              <strong>{result.latency !== null ? `${result.latency} ms` : "No response"}</strong>
-            </div>
-            {result.last_error && <p className="error-message">{result.last_error}</p>}
+        {error ? (
+          <p className="form-error" role="alert">
+            {error}
+          </p>
+        ) : (
+          <div className="examples">
+            <span>Try a popular site:</span>
+            {EXAMPLE_SITES.map((site) => (
+              <button
+                key={site}
+                onClick={() => navigate(`/status/${site}`)}
+                type="button"
+              >
+                {site}
+              </button>
+            ))}
           </div>
         )}
       </section>
 
-      <section className="dashboard-grid">
-        <div className="panel">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">Your saved trackers</p>
-              <h2>Guest monitors</h2>
-            </div>
-            <span className="count-pill">{monitors.length}</span>
+      <section className="feature-strip">
+        <article>
+          <span className="feature-icon">↗</span>
+          <div>
+            <h2>Fresh availability check</h2>
+            <p>A new request is made every time you check.</p>
           </div>
-
-          {monitors.length === 0 && <p className="empty-text">No monitors saved yet.</p>}
-
-          <div className="monitor-list">
-            {monitors.map((monitor) => (
-              <article className="monitor-card" key={monitor.id}>
-                <div className="monitor-topline">
-                  <div>
-                    <h3>{monitor.name}</h3>
-                    <p>{monitor.target}</p>
-                  </div>
-                  <span className={`status-badge ${monitor.status ?? "unknown"}`}>
-                    {statusLabel(monitor.status)}
-                  </span>
-                </div>
-
-                <div className="monitor-details">
-                  <span>{monitor.check_type.toUpperCase()}</span>
-                  <span>Port {monitor.port}</span>
-                  <span>{monitor.latency !== null ? `${monitor.latency} ms` : "No latency"}</span>
-                </div>
-
-                <p className="muted-text">
-                  Last checked: {monitor.last_checked ?? "Never"}
-                </p>
-                {monitor.last_error && <p className="error-message">{monitor.last_error}</p>}
-
-                <div className="button-row">
-                  <button type="button" onClick={() => checkMonitor(monitor.id)}>
-                    Check
-                  </button>
-                  <button className="ghost-button" type="button" onClick={() => deleteMonitor(monitor.id)}>
-                    Delete
-                  </button>
-                </div>
-              </article>
-            ))}
+        </article>
+        <article>
+          <span className="feature-icon">▥</span>
+          <div>
+            <h2>Community outage history</h2>
+            <p>See when other visitors reported a problem.</p>
           </div>
-        </div>
-
-        <div className="panel">
-          <div className="panel-header">
-            <div>
-              <p className="eyebrow">Global activity</p>
-              <h2>Most checked</h2>
-            </div>
+        </article>
+        <article>
+          <span className="feature-icon">✓</span>
+          <div>
+            <h2>Private by default</h2>
+            <p>No login, tracking profile, or saved account.</p>
           </div>
-
-          {popularSites.length === 0 && <p className="empty-text">Popular sites will appear after checks.</p>}
-
-          <div className="popular-list">
-            {popularSites.map((site, index) => (
-              <article className="popular-card" key={site.target}>
-                <span className="rank">#{index + 1}</span>
-                <div>
-                  <h3>{site.target}</h3>
-                  <p>{site.total_checks} checks</p>
-                </div>
-                <span className={`status-badge ${site.last_status ?? "unknown"}`}>
-                  {statusLabel(site.last_status)}
-                </span>
-              </article>
-            ))}
-          </div>
-        </div>
+        </article>
       </section>
+
+      <Footer />
     </main>
   );
 }
 
-export default App
+function OutageChart({
+  history,
+  range,
+}: {
+  history: HistoryData | null;
+  range: HistoryRange;
+}) {
+  const points = history?.range === range ? history.points : [];
+  const fallbackLength = range === "24h" ? 24 : 7;
+  const visiblePoints =
+    points.length > 0
+      ? points
+      : Array.from({ length: fallbackLength }, (_, index) => ({
+          key: String(index),
+          count: 0,
+        }));
+  const maximum = Math.max(1, ...visiblePoints.map((point) => point.count));
+
+  function formatLabel(key: string, index: number) {
+    if (!points.length) return "";
+
+    if (range === "7d") {
+      return new Intl.DateTimeFormat("en", {
+        weekday: "short",
+        timeZone: "UTC",
+      }).format(new Date(`${key}T00:00:00Z`));
+    }
+
+    if (![0, 6, 12, 18, 23].includes(index)) return "";
+    return new Intl.DateTimeFormat("en", {
+      hour: "numeric",
+      timeZone: "UTC",
+    }).format(new Date(key));
+  }
+
+  return (
+    <div
+      aria-label={`Outage reports over the last ${range === "24h" ? "24 hours" : "7 days"}`}
+      className="outage-chart"
+      role="img"
+    >
+      <div className="chart-lines">
+        <i />
+        <i />
+        <i />
+      </div>
+      <div className="bars">
+        {visiblePoints.map((point, index) => (
+          <div className="bar-column" key={point.key}>
+            <div className="bar-track">
+              <span
+                className={`bar${point.count > 0 ? " has-reports" : ""}`}
+                style={{
+                  height:
+                    point.count > 0
+                      ? `${Math.max(12, (point.count / maximum) * 100)}%`
+                      : "3px",
+                }}
+                title={`${point.count} outage report${point.count === 1 ? "" : "s"}`}
+              />
+            </div>
+            <span className="bar-label">
+              {formatLabel(point.key, index)}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StatusPage() {
+  const navigate = useNavigate();
+  const params = useParams();
+  const target = useMemo(() => {
+    try {
+      return normalizeWebsite(decodeURIComponent(params.target ?? ""));
+    } catch {
+      return "";
+    }
+  }, [params.target]);
+
+  const [searchValue, setSearchValue] = useState(target);
+  const [check, setCheck] = useState<CheckResult | null>(null);
+  const [history, setHistory] = useState<HistoryData | null>(null);
+  const [range, setRange] = useState<HistoryRange>("24h");
+  const [isChecking, setIsChecking] = useState(true);
+  const [isReporting, setIsReporting] = useState(false);
+  const [error, setError] = useState(target ? "" : "Invalid website address.");
+  const [reportMessage, setReportMessage] = useState("");
+
+  const loadHistory = useCallback(
+    async (selectedRange: HistoryRange) => {
+      if (!target) return;
+      const response = await fetch(
+        `${API_BASE}/api/status/${encodeURIComponent(target)}/history?range=${selectedRange}`,
+      );
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail ?? "Could not load outage history.");
+      }
+
+      setHistory(data);
+    },
+    [target],
+  );
+
+  const checkWebsite = useCallback(async () => {
+    if (!target) return;
+    setIsChecking(true);
+    setError("");
+
+    try {
+      const response = await fetch(`${API_BASE}/api/check`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ website: target }),
+      });
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail ?? "Could not check this website.");
+      }
+
+      setCheck(data);
+      await loadHistory(range);
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Could not check this website.",
+      );
+    } finally {
+      setIsChecking(false);
+    }
+  }, [loadHistory, range, target]);
+
+  useEffect(() => {
+    const task = window.setTimeout(() => void checkWebsite(), 0);
+    return () => window.clearTimeout(task);
+    // Run once when the route changes, not every time the chart range changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [target]);
+
+  async function changeRange(selectedRange: HistoryRange) {
+    setRange(selectedRange);
+    try {
+      await loadHistory(selectedRange);
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Could not load outage history.",
+      );
+    }
+  }
+
+  function submitSearch(event: FormEvent) {
+    event.preventDefault();
+    try {
+      navigate(`/status/${encodeURIComponent(normalizeWebsite(searchValue))}`);
+    } catch (inputError) {
+      setError(
+        inputError instanceof Error
+          ? inputError.message
+          : "Enter a valid website.",
+      );
+    }
+  }
+
+  async function reportOutage() {
+    setIsReporting(true);
+    setReportMessage("");
+
+    try {
+      const response = await fetch(
+        `${API_BASE}/api/status/${encodeURIComponent(target)}/report`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ reporter_id: getReporterId() }),
+        },
+      );
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail ?? "Could not submit your report.");
+      }
+
+      setReportMessage("Thanks — your outage report has been added.");
+      await loadHistory(range);
+    } catch (requestError) {
+      setReportMessage(
+        requestError instanceof Error
+          ? requestError.message
+          : "Could not submit your report.",
+      );
+    } finally {
+      setIsReporting(false);
+    }
+  }
+
+  const status = check?.status ?? "up";
+  const statusCopy = STATUS_COPY[status];
+  const reportsLast15Minutes =
+    history?.summary.reports_last_15_minutes ?? 0;
+
+  return (
+    <main className="page-shell status-page">
+      <header className="site-header status-header">
+        <Brand />
+        <form className="header-search" onSubmit={submitSearch}>
+          <SearchIcon />
+          <input
+            aria-label="Check another website"
+            onChange={(event) => setSearchValue(event.target.value)}
+            spellCheck={false}
+            value={searchValue}
+          />
+          <button type="submit">Check</button>
+        </form>
+      </header>
+
+      <Link className="back-link" to="/">
+        ← Check another site
+      </Link>
+
+      <section className={`status-hero status-${status}`}>
+        <div className={`status-orb${isChecking ? " loading" : ""}`}>
+          {!isChecking && (status === "up" ? "✓" : "!")}
+        </div>
+        <div className="status-heading">
+          <p className="panel-eyebrow">Current status</p>
+          <h1>
+            {displayTarget(target || "Website")}{" "}
+            <span>
+              {isChecking ? "is being checked" : statusCopy.title}
+            </span>
+          </h1>
+          <p>
+            {isChecking
+              ? "Testing the website from a fresh connection."
+              : statusCopy.detail}
+          </p>
+        </div>
+        <div className="check-meta">
+          <span className="freshness-dot" />
+          <div>
+            <strong>
+              {isChecking
+                ? "Running a fresh check…"
+                : `Checked ${relativeTime(check?.checked_at ?? null)}`}
+            </strong>
+            <span>
+              {check?.latency ? `${check.latency} ms response` : "Live request"}
+            </span>
+          </div>
+        </div>
+        <button
+          className="secondary-button"
+          disabled={isChecking}
+          onClick={() => void checkWebsite()}
+          type="button"
+        >
+          ↻ {isChecking ? "Checking…" : "Check again"}
+        </button>
+      </section>
+
+      {error && (
+        <p className="inline-alert" role="alert">
+          {error}
+        </p>
+      )}
+
+      <section className="content-grid">
+        <article className="panel chart-card">
+          <div className="panel-header">
+            <div>
+              <p className="panel-eyebrow">Community signal</p>
+              <h2>Outage reports</h2>
+              <p>Reports submitted by visitors during this period.</p>
+            </div>
+            <div className="range-switch">
+              <button
+                className={range === "24h" ? "active" : ""}
+                onClick={() => void changeRange("24h")}
+                type="button"
+              >
+                24 hours
+              </button>
+              <button
+                className={range === "7d" ? "active" : ""}
+                onClick={() => void changeRange("7d")}
+                type="button"
+              >
+                7 days
+              </button>
+            </div>
+          </div>
+
+          <div className="chart-summary">
+            <div>
+              <strong>{history?.summary.reports_in_range ?? 0}</strong>
+              <span>total reports</span>
+            </div>
+            <p>
+              <span
+                className={
+                  reportsLast15Minutes >= 4 ? "signal high" : "signal"
+                }
+              />
+              {reportsLast15Minutes === 0
+                ? "No unusual report spike"
+                : reportsLast15Minutes < 4
+                  ? "A few recent reports"
+                  : "Elevated outage reports"}
+            </p>
+          </div>
+
+          <OutageChart history={history} range={range} />
+          <div className="chart-caption">
+            <span>{range === "24h" ? "24 hours ago" : "7 days ago"}</span>
+            <span>Now</span>
+          </div>
+        </article>
+
+        <aside className="panel report-card">
+          <span className="report-icon">!</span>
+          <p className="panel-eyebrow">Community report</p>
+          <h2>Having trouble too?</h2>
+          <p>
+            If {displayTarget(target)} is not working for you, add your report
+            to the graph. No account is needed.
+          </p>
+          <button
+            className="report-button"
+            disabled={isReporting}
+            onClick={() => void reportOutage()}
+            type="button"
+          >
+            {isReporting ? "Submitting…" : "Report an outage"}
+          </button>
+          {reportMessage && (
+            <p className="report-message" role="status">
+              {reportMessage}
+            </p>
+          )}
+          <small>One report per website, per hour.</small>
+        </aside>
+      </section>
+
+      <section className="summary-row">
+        <article>
+          <span className="summary-icon green">✓</span>
+          <div>
+            <p>Latest check</p>
+            <strong>{check ? STATUS_COPY[check.status].title : "Checking…"}</strong>
+          </div>
+        </article>
+        <article>
+          <span className="summary-icon blue">≋</span>
+          <div>
+            <p>Reports in the last hour</p>
+            <strong>{history?.summary.reports_last_hour ?? 0}</strong>
+          </div>
+        </article>
+        <article>
+          <span className="summary-icon neutral">◷</span>
+          <div>
+            <p>Last community report</p>
+            <strong>
+              {relativeTime(history?.summary.last_reported_at ?? null)}
+            </strong>
+          </div>
+        </article>
+      </section>
+
+      <p className="disclaimer">
+        ⓘ A successful check means the website responded from the checker. Your
+        local connection, DNS, or account may still experience a separate issue.
+      </p>
+
+      <Footer />
+    </main>
+  );
+}
+
+function Footer() {
+  return (
+    <footer>
+      <Brand small />
+      <p>Independent status checks and community reports.</p>
+    </footer>
+  );
+}
+
+export default function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<HomePage />} />
+      <Route path="/status/:target" element={<StatusPage />} />
+      <Route path="*" element={<Navigate replace to="/" />} />
+    </Routes>
+  );
+}
