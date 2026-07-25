@@ -52,26 +52,26 @@ The live status and the community report graph are separate signals:
 
 ```text
 networkstatusmonitor/
-├── backend/
-│   ├── routes/
-│   │   ├── __init__.py
-│   │   └── monitors.py
-│   ├── database.py
-│   ├── main.py
-│   ├── models.py
-│   └── requirements.txt
-├── frontend/
-│   ├── src/
-│   │   ├── App.css
-│   │   ├── App.tsx
-│   │   ├── index.css
-│   │   └── main.tsx
-│   ├── .env.example
-│   ├── index.html
-│   ├── package.json
-│   └── vite.config.ts
-├── .gitignore
-└── README.md
+|-- backend/
+|   |-- routes/
+|   |   |-- __init__.py
+|   |   `-- monitors.py
+|   |-- database.py
+|   |-- main.py
+|   |-- models.py
+|   `-- requirements.txt
+|-- frontend/
+|   |-- src/
+|   |   |-- App.css
+|   |   |-- App.tsx
+|   |   |-- index.css
+|   |   `-- main.tsx
+|   |-- .env.example
+|   |-- index.html
+|   |-- package.json
+|   `-- vite.config.ts
+|-- .gitignore
+`-- README.md
 ```
 
 ## Getting started
