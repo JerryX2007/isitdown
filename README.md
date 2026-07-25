@@ -52,26 +52,26 @@ The live status and the community report graph are separate signals:
 
 ```text
 networkstatusmonitor/
-â”œâ”€â”€ backend/
-â”‚   â”œâ”€â”€ routes/
-â”‚   â”‚   â”œâ”€â”€ __init__.py
-â”‚   â”‚   â””â”€â”€ monitors.py
-â”‚   â”œâ”€â”€ database.py
-â”‚   â”œâ”€â”€ main.py
-â”‚   â”œâ”€â”€ models.py
-â”‚   â””â”€â”€ requirements.txt
-â”œâ”€â”€ frontend/
-â”‚   â”œâ”€â”€ src/
-â”‚   â”‚   â”œâ”€â”€ App.css
-â”‚   â”‚   â”œâ”€â”€ App.tsx
-â”‚   â”‚   â”œâ”€â”€ index.css
-â”‚   â”‚   â””â”€â”€ main.tsx
-â”‚   â”œâ”€â”€ .env.example
-â”‚   â”œâ”€â”€ index.html
-â”‚   â”œâ”€â”€ package.json
-â”‚   â””â”€â”€ vite.config.ts
-â”œâ”€â”€ .gitignore
-â””â”€â”€ README.md
+├── backend/
+│   ├── routes/
+│   │   ├── __init__.py
+│   │   └── monitors.py
+│   ├── database.py
+│   ├── main.py
+│   ├── models.py
+│   └── requirements.txt
+├── frontend/
+│   ├── src/
+│   │   ├── App.css
+│   │   ├── App.tsx
+│   │   ├── index.css
+│   │   └── main.tsx
+│   ├── .env.example
+│   ├── index.html
+│   ├── package.json
+│   └── vite.config.ts
+├── .gitignore
+└── README.md
 ```
 
 ## Getting started
