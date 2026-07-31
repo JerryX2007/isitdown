@@ -7,9 +7,12 @@ from re import fullmatch
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from database import get_db
+from database import get_session
+from database_models import CheckHistory, OutageReportRecord
 from models import Monitor, OutageReport
 
 router = APIRouter(prefix="/api", tags=["website status"])
@@ -22,6 +25,11 @@ def utc_now():
 def utc_timestamp():
     return utc_now().isoformat().replace("+00:00", "Z")
 
+def as_utc(value: datetime):
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
 
 def get_public_addresses(target: str):
     try:
@@ -172,25 +180,22 @@ def check_target(website: str, timeout: float):
     }
 
 
-def record_check(result: dict):
-    connection = get_db()
-    connection.execute(
-        """
-        INSERT INTO check_history
-        (target, status, latency, status_code, checked_at, error)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            result["target"],
-            result["status"],
-            result["latency"],
-            result["status_code"],
-            result["checked_at"],
-            result["error"],
-        ),
+def record_check(result: dict, session: Session):
+    checked_at = datetime.fromisoformat(
+        result["checked_at"].replace("Z", "+00:00")
     )
-    connection.commit()
-    connection.close()
+
+    record = CheckHistory(
+        target=result["target"],
+        status=result["status"],
+        latency=result["latency"],
+        status_code=result["status_code"],
+        checked_at=checked_at,
+        error=result["error"],
+    )
+
+    session.add(record)
+    session.commit()
 
 
 def create_empty_timeline(selected_range: str):
@@ -222,77 +227,99 @@ def create_empty_timeline(selected_range: str):
 @router.get("/status/{target}/history")
 def get_outage_history(
     target: str,
-    selected_range: str = Query(default="24h", alias="range", pattern="^(24h|7d)$"),
+    selected_range: str = Query(
+        default="24h",
+        alias="range",
+        pattern="^(24h|7d)$",
+    ),
+    session: Session = Depends(get_session),
 ):
     normalized = normalize_website(target)
     clean_target = normalized["target"]
+    now = utc_now()
     timeline = create_empty_timeline(selected_range)
-    bucket_format = "%Y-%m-%d" if selected_range == "7d" else "%Y-%m-%dT%H:00:00Z"
-    since = "-7 days" if selected_range == "7d" else "-24 hours"
 
-    connection = get_db()
-    report_rows = connection.execute(
-        f"""
-        SELECT
-            strftime('{bucket_format}', datetime(created_at)) AS bucket,
-            COUNT(*) AS report_count
-        FROM outage_reports
-        WHERE target = ?
-          AND datetime(created_at) >= datetime('now', ?)
-        GROUP BY bucket
-        ORDER BY bucket ASC
-        """,
-        (clean_target, since),
-    ).fetchall()
+    if selected_range == "7d":
+        cutoff = (
+            now.replace(hour=0, minute=0, second=0, microsecond=0)
+            - timedelta(days=6)
+        )
+        bucket_format = "%Y-%m-%d"
+    else:
+        cutoff = (
+            now.replace(minute=0, second=0, microsecond=0)
+            - timedelta(hours=23)
+        )
+        bucket_format = "%Y-%m-%dT%H:00:00Z"
 
-    summary = dict(
-        connection.execute(
-            """
-            SELECT
-                COUNT(*) AS reports_in_range,
-                COALESCE(SUM(
-                    CASE
-                        WHEN datetime(created_at) >= datetime('now', '-1 hour')
-                        THEN 1 ELSE 0
-                    END
-                ), 0) AS reports_last_hour,
-                COALESCE(SUM(
-                    CASE
-                        WHEN datetime(created_at) >= datetime('now', '-15 minutes')
-                        THEN 1 ELSE 0
-                    END
-                ), 0) AS reports_last_15_minutes,
-                MAX(created_at) AS last_reported_at
-            FROM outage_reports
-            WHERE target = ?
-              AND datetime(created_at) >= datetime('now', ?)
-            """,
-            (clean_target, since),
-        ).fetchone()
-    )
+    report_times = [
+        as_utc(value)
+        for value in session.scalars(
+            select(OutageReportRecord.created_at)
+            .where(
+                OutageReportRecord.target == clean_target,
+                OutageReportRecord.created_at >= cutoff,
+            )
+            .order_by(OutageReportRecord.created_at)
+        ).all()
+    ]
 
-    latest_check_row = connection.execute(
-        """
-        SELECT status, latency, status_code, checked_at, error
-        FROM check_history
-        WHERE target = ?
-        ORDER BY datetime(checked_at) DESC
-        LIMIT 1
-        """,
-        (clean_target,),
-    ).fetchone()
-    connection.close()
+    counts: dict[str, int] = {}
 
-    counts = {row["bucket"]: row["report_count"] for row in report_rows}
+    for created_at in report_times:
+        bucket = created_at.strftime(bucket_format)
+        counts[bucket] = counts.get(bucket, 0) + 1
+
     for point in timeline:
         point["count"] = counts.get(point["key"], 0)
+
+    one_hour_ago = now - timedelta(hours=1)
+    fifteen_minutes_ago = now - timedelta(minutes=15)
+
+    latest_check = session.scalar(
+        select(CheckHistory)
+        .where(CheckHistory.target == clean_target)
+        .order_by(CheckHistory.checked_at.desc())
+        .limit(1)
+    )
+
+    latest_check_data = None
+
+    if latest_check is not None:
+        latest_check_data = {
+            "target": latest_check.target,
+            "status": latest_check.status,
+            "latency": latest_check.latency,
+            "status_code": latest_check.status_code,
+            "checked_at": (
+                as_utc(latest_check.checked_at)
+                .isoformat()
+                .replace("+00:00", "Z")
+            ),
+            "error": latest_check.error,
+        }
+
+    last_reported_at = max(report_times) if report_times else None
 
     return {
         "target": clean_target,
         "range": selected_range,
         "points": timeline,
-        "summary": summary,
-        "latest_check": dict(latest_check_row) if latest_check_row else None,
+        "summary": {
+            "reports_in_range": len(report_times),
+            "reports_last_hour": sum(
+                value >= one_hour_ago for value in report_times
+            ),
+            "reports_last_15_minutes": sum(
+                value >= fifteen_minutes_ago for value in report_times
+            ),
+            "last_reported_at": (
+                last_reported_at.isoformat().replace("+00:00", "Z")
+                if last_reported_at
+                else None
+            ),
+        },
+        "latest_check": latest_check_data,
     }
 
 
@@ -300,49 +327,58 @@ def get_outage_history(
 
 
 @router.post("/check")
-def check_website(request: Monitor):
+def check_website(
+    request: Monitor,
+    session: Session = Depends(get_session),
+):
     result = check_target(request.website, request.timeout)
-    record_check(result)
+    record_check(result, session)
     return result
 
 
 @router.post("/status/{target}/report", status_code=201)
-def report_outage(target: str, report: OutageReport):
+def report_outage(
+    target: str,
+    report: OutageReport,
+    session: Session = Depends(get_session),
+):
     normalized = normalize_website(target)
     clean_target = normalized["target"]
+
     reporter_hash = sha256(
         f"{clean_target}:{report.reporter_id}".encode("utf-8")
     ).hexdigest()
 
-    connection = get_db()
-    existing_report = connection.execute(
-        """
-        SELECT id
-        FROM outage_reports
-        WHERE target = ?
-          AND reporter_hash = ?
-          AND datetime(created_at) >= datetime('now', '-1 hour')
-        LIMIT 1
-        """,
-        (clean_target, reporter_hash),
-    ).fetchone()
+    one_hour_ago = utc_now() - timedelta(hours=1)
 
-    if existing_report:
-        connection.close()
+    existing_report = session.scalar(
+        select(OutageReportRecord.id)
+        .where(
+            OutageReportRecord.target == clean_target,
+            OutageReportRecord.reporter_hash == reporter_hash,
+            OutageReportRecord.created_at >= one_hour_ago,
+        )
+        .limit(1)
+    )
+
+    if existing_report is not None:
         raise HTTPException(
             status_code=409,
             detail="You already reported an issue with this website recently.",
         )
 
-    created_at = utc_timestamp()
-    connection.execute(
-        """
-        INSERT INTO outage_reports (target, reporter_hash, created_at)
-        VALUES (?, ?, ?)
-        """,
-        (clean_target, reporter_hash, created_at),
-    )
-    connection.commit()
-    connection.close()
+    created_at = utc_now()
 
-    return {"accepted": True, "created_at": created_at}
+    session.add(
+        OutageReportRecord(
+            target=clean_target,
+            reporter_hash=reporter_hash,
+            created_at=created_at,
+        )
+    )
+    session.commit()
+
+    return {
+        "accepted": True,
+        "created_at": created_at.isoformat().replace("+00:00", "Z"),
+    }

@@ -1,36 +1,53 @@
-import sqlite3
-from pathlib import Path
+from collections.abc import Generator
 
-DATABASE = Path(__file__).with_name("monitor.db")
+from sqlalchemy import create_engine
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-
-def get_db():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+from config import settings
 
 
-def init_db():
-    conn = get_db()
-    conn.execute("""CREATE TABLE IF NOT EXISTS check_history (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 target TEXT NOT NULL,
-                 status TEXT CHECK(status IN ('up', 'issues', 'down')) NOT NULL,
-                 latency REAL,
-                 status_code INTEGER,
-                 checked_at TEXT NOT NULL,
-                 error TEXT)""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS outage_reports (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 target TEXT NOT NULL,
-                 reporter_hash TEXT NOT NULL,
-                 created_at TEXT NOT NULL)""")
-    conn.execute("""CREATE INDEX IF NOT EXISTS check_history_target_time_idx
-                 ON check_history(target, checked_at)""")
-    conn.execute("""CREATE INDEX IF NOT EXISTS outage_reports_target_time_idx
-                 ON outage_reports(target, created_at)""")
-    conn.execute("""CREATE INDEX IF NOT EXISTS outage_reports_rate_limit_idx
-                 ON outage_reports(target, reporter_hash, created_at)""")
-    conn.commit()
-    conn.close()
+database_url = settings.database_url
+
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace(
+        "postgres://",
+        "postgresql+psycopg://",
+        1,
+    )
+elif database_url.startswith("postgresql://"):
+    database_url = database_url.replace(
+        "postgresql://",
+        "postgresql+psycopg://",
+        1,
+    )
+
+connect_args = (
+    {"check_same_thread": False}
+    if database_url.startswith("sqlite")
+    else {}
+)
+
+engine = create_engine(
+    database_url,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    expire_on_commit=False,
+)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def get_session() -> Generator[Session, None, None]:
+    session = SessionLocal()
+
+    try:
+        yield session
+    finally:
+        session.close()
