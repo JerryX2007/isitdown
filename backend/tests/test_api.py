@@ -1,9 +1,11 @@
 import socket
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 
 import pytest
+from sqlalchemy import func, select
 
-import database
+from database_models import CheckHistory, OutageReportRecord
 from routes import monitors
 
 
@@ -14,7 +16,11 @@ def test_health_endpoint(client):
     assert response.json() == {"status": "ok"}
 
 
-def test_check_endpoint_records_result(client, monkeypatch):
+def test_check_endpoint_records_result(
+    client,
+    monkeypatch,
+    db_session,
+):
     fake_result = {
         "target": "example.com",
         "status": "up",
@@ -38,14 +44,19 @@ def test_check_endpoint_records_result(client, monkeypatch):
     assert response.status_code == 200
     assert response.json() == fake_result
 
-    connection = database.get_db()
-    saved_check = connection.execute("""
-        SELECT target, status, latency, status_code, checked_at, error
-        FROM check_history
-        """).fetchone()
-    connection.close()
+    saved_check = db_session.scalar(select(CheckHistory))
 
-    assert dict(saved_check) == fake_result
+    assert saved_check is not None
+    assert {
+        "target": saved_check.target,
+        "status": saved_check.status,
+        "latency": saved_check.latency,
+        "status_code": saved_check.status_code,
+        "checked_at": (
+            monitors.as_utc(saved_check.checked_at).isoformat().replace("+00:00", "Z")
+        ),
+        "error": saved_check.error,
+    } == fake_result
 
 
 def test_check_endpoint_uses_default_timeout(client, monkeypatch):
@@ -131,6 +142,7 @@ def test_check_endpoint_returns_400_for_invalid_website(
     client,
     website,
     expected_detail,
+    db_session,
 ):
     response = client.post(
         "/api/check",
@@ -140,15 +152,15 @@ def test_check_endpoint_returns_400_for_invalid_website(
     assert response.status_code == 400
     assert response.json() == {"detail": expected_detail}
 
-    connection = database.get_db()
-    saved_checks = connection.execute("SELECT COUNT(*) FROM check_history").fetchone()[
-        0
-    ]
-    connection.close()
+    saved_checks = db_session.scalar(select(func.count()).select_from(CheckHistory))
     assert saved_checks == 0
 
 
-def test_check_endpoint_returns_400_for_private_dns(client, monkeypatch):
+def test_check_endpoint_returns_400_for_private_dns(
+    client,
+    monkeypatch,
+    db_session,
+):
     monkeypatch.setattr(
         monitors.socket,
         "getaddrinfo",
@@ -173,20 +185,26 @@ def test_check_endpoint_returns_400_for_private_dns(client, monkeypatch):
         "detail": "Private or local network addresses cannot be checked."
     }
 
-    connection = database.get_db()
-    saved_checks = connection.execute("SELECT COUNT(*) FROM check_history").fetchone()[
-        0
-    ]
-    connection.close()
+    saved_checks = db_session.scalar(select(func.count()).select_from(CheckHistory))
+    assert saved_checks == 0
     assert saved_checks == 0
 
 
-def test_report_outage_accepts_and_hashes_reporter_id(client, monkeypatch):
-    monkeypatch.setattr(
-        monitors,
-        "utc_timestamp",
-        lambda: "2026-07-31T12:00:00Z",
+def test_report_outage_accepts_and_hashes_reporter_id(
+    client,
+    monkeypatch,
+    db_session,
+):
+    fixed_now = datetime(
+        2026,
+        7,
+        31,
+        12,
+        0,
+        tzinfo=timezone.utc,
     )
+
+    monkeypatch.setattr(monitors, "utc_now", lambda: fixed_now)
 
     response = client.post(
         "/api/status/example.com/report",
@@ -199,18 +217,15 @@ def test_report_outage_accepts_and_hashes_reporter_id(client, monkeypatch):
         "created_at": "2026-07-31T12:00:00Z",
     }
 
-    connection = database.get_db()
-    saved_report = connection.execute("""
-        SELECT target, reporter_hash, created_at
-        FROM outage_reports
-        """).fetchone()
-    connection.close()
+    saved_report = db_session.scalar(select(OutageReportRecord))
 
-    assert dict(saved_report) == {
-        "target": "example.com",
-        "reporter_hash": sha256(b"example.com:browser-identifier").hexdigest(),
-        "created_at": "2026-07-31T12:00:00Z",
-    }
+    assert saved_report is not None
+    assert saved_report.target == "example.com"
+    assert (
+        saved_report.reporter_hash
+        == sha256(b"example.com:browser-identifier").hexdigest()
+    )
+    assert monitors.as_utc(saved_report.created_at) == fixed_now
 
 
 def test_report_outage_rejects_duplicate_recent_report(client):
@@ -250,47 +265,64 @@ def test_history_endpoint_returns_empty_24_hour_timeline(client):
     assert body["latest_check"] is None
 
 
-def test_history_endpoint_returns_populated_seven_day_summary(client):
-    connection = database.get_db()
-    connection.execute("""
-        INSERT INTO outage_reports (target, reporter_hash, created_at)
-        VALUES ('example.com', 'recent', datetime('now', '-10 minutes'))
-        """)
-    connection.execute("""
-        INSERT INTO outage_reports (target, reporter_hash, created_at)
-        VALUES ('example.com', 'earlier', datetime('now', '-2 hours'))
-        """)
-    connection.execute("""
-        INSERT INTO outage_reports (target, reporter_hash, created_at)
-        VALUES ('example.com', 'expired', datetime('now', '-8 days'))
-        """)
-    connection.execute("""
-        INSERT INTO check_history
-        (target, status, latency, status_code, checked_at, error)
-        VALUES (
-            'example.com', 'issues', 125.5, 503, datetime('now'), NULL
-        )
-        """)
-    connection.commit()
-    connection.close()
+def test_history_endpoint_returns_populated_seven_day_summary(
+    client,
+    db_session,
+):
+    now = monitors.utc_now()
+
+    db_session.add_all(
+        [
+            OutageReportRecord(
+                target="example.com",
+                reporter_hash="recent",
+                created_at=now - timedelta(minutes=10),
+            ),
+            OutageReportRecord(
+                target="example.com",
+                reporter_hash="earlier",
+                created_at=now - timedelta(hours=2),
+            ),
+            OutageReportRecord(
+                target="example.com",
+                reporter_hash="expired",
+                created_at=now - timedelta(days=8),
+            ),
+            CheckHistory(
+                target="example.com",
+                status="issues",
+                latency=125.5,
+                status_code=503,
+                checked_at=now,
+                error=None,
+            ),
+        ]
+    )
+    db_session.commit()
 
     response = client.get("/api/status/example.com/history?range=7d")
 
     assert response.status_code == 200
+
     body = response.json()
+
     assert body["target"] == "example.com"
     assert body["range"] == "7d"
     assert len(body["points"]) == 7
     assert sum(point["count"] for point in body["points"]) == 2
+
     assert body["summary"]["reports_in_range"] == 2
     assert body["summary"]["reports_last_hour"] == 1
     assert body["summary"]["reports_last_15_minutes"] == 1
     assert body["summary"]["last_reported_at"] is not None
+
     latest_check = body["latest_check"]
     assert latest_check["checked_at"] is not None
+
     assert {
         key: value for key, value in latest_check.items() if key != "checked_at"
     } == {
+        "target": "example.com",
         "status": "issues",
         "latency": 125.5,
         "status_code": 503,
@@ -336,18 +368,20 @@ def test_report_outage_rejects_local_target(client):
     assert response.json() == {"detail": "Enter a public website address."}
 
 
-def test_report_outage_accepts_report_after_rate_limit_expires(client):
+def test_report_outage_accepts_report_after_rate_limit_expires(
+    client,
+    db_session,
+):
     reporter_hash = sha256(b"example.com:browser-identifier").hexdigest()
-    connection = database.get_db()
-    connection.execute(
-        """
-        INSERT INTO outage_reports (target, reporter_hash, created_at)
-        VALUES (?, ?, datetime('now', '-2 hours'))
-        """,
-        ("example.com", reporter_hash),
+
+    db_session.add(
+        OutageReportRecord(
+            target="example.com",
+            reporter_hash=reporter_hash,
+            created_at=monitors.utc_now() - timedelta(hours=2),
+        )
     )
-    connection.commit()
-    connection.close()
+    db_session.commit()
 
     response = client.post(
         "/api/status/example.com/report",

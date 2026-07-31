@@ -1,8 +1,10 @@
-import database
+from sqlalchemy import select
+
+from database_models import CheckHistory
 from routes import monitors
 
 
-def test_record_check_preserves_failed_check_details(client):
+def test_record_check_preserves_failed_check_details(db_session):
     failed_check = {
         "target": "unavailable.example",
         "status": "down",
@@ -12,13 +14,18 @@ def test_record_check_preserves_failed_check_details(client):
         "error": "The connection timed out.",
     }
 
-    monitors.record_check(failed_check)
+    monitors.record_check(failed_check, db_session)
 
-    connection = database.get_db()
-    saved_check = connection.execute("""
-        SELECT target, status, latency, status_code, checked_at, error
-        FROM check_history
-        """).fetchone()
-    connection.close()
+    saved_check = db_session.scalar(select(CheckHistory))
 
-    assert dict(saved_check) == failed_check
+    assert saved_check is not None
+    assert {
+        "target": saved_check.target,
+        "status": saved_check.status,
+        "latency": saved_check.latency,
+        "status_code": saved_check.status_code,
+        "checked_at": (
+            monitors.as_utc(saved_check.checked_at).isoformat().replace("+00:00", "Z")
+        ),
+        "error": saved_check.error,
+    } == failed_check
