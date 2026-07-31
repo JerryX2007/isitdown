@@ -5,7 +5,6 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from config import settings
 
-
 database_url = settings.database_url
 
 if database_url.startswith("postgres://"):
@@ -21,11 +20,7 @@ elif database_url.startswith("postgresql://"):
         1,
     )
 
-connect_args = (
-    {"check_same_thread": False}
-    if database_url.startswith("sqlite")
-    else {}
-)
+connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
 
 engine = create_engine(
     database_url,

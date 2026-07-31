@@ -5,7 +5,6 @@ from alembic import context
 import database_models
 from database import Base, engine
 
-
 config = context.config
 
 if config.config_file_name is not None:

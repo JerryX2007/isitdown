@@ -25,11 +25,13 @@ def utc_now():
 def utc_timestamp():
     return utc_now().isoformat().replace("+00:00", "Z")
 
+
 def as_utc(value: datetime):
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
 
     return value.astimezone(timezone.utc)
+
 
 def get_public_addresses(target: str):
     try:
@@ -181,9 +183,7 @@ def check_target(website: str, timeout: float):
 
 
 def record_check(result: dict, session: Session):
-    checked_at = datetime.fromisoformat(
-        result["checked_at"].replace("Z", "+00:00")
-    )
+    checked_at = datetime.fromisoformat(result["checked_at"].replace("Z", "+00:00"))
 
     record = CheckHistory(
         target=result["target"],
@@ -240,16 +240,12 @@ def get_outage_history(
     timeline = create_empty_timeline(selected_range)
 
     if selected_range == "7d":
-        cutoff = (
-            now.replace(hour=0, minute=0, second=0, microsecond=0)
-            - timedelta(days=6)
+        cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
+            days=6
         )
         bucket_format = "%Y-%m-%d"
     else:
-        cutoff = (
-            now.replace(minute=0, second=0, microsecond=0)
-            - timedelta(hours=23)
-        )
+        cutoff = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
         bucket_format = "%Y-%m-%dT%H:00:00Z"
 
     report_times = [
@@ -292,9 +288,7 @@ def get_outage_history(
             "latency": latest_check.latency,
             "status_code": latest_check.status_code,
             "checked_at": (
-                as_utc(latest_check.checked_at)
-                .isoformat()
-                .replace("+00:00", "Z")
+                as_utc(latest_check.checked_at).isoformat().replace("+00:00", "Z")
             ),
             "error": latest_check.error,
         }
@@ -307,9 +301,7 @@ def get_outage_history(
         "points": timeline,
         "summary": {
             "reports_in_range": len(report_times),
-            "reports_last_hour": sum(
-                value >= one_hour_ago for value in report_times
-            ),
+            "reports_last_hour": sum(value >= one_hour_ago for value in report_times),
             "reports_last_15_minutes": sum(
                 value >= fifteen_minutes_ago for value in report_times
             ),
