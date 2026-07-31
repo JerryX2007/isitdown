@@ -8,3 +8,7 @@ monitor.db
 node_modules/
 dist/
 .pytest_cache/
+
+**/.env
+**/.env.*
+!**/.env.example
