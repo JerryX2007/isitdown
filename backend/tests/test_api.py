@@ -1,3 +1,5 @@
+from hashlib import sha256
+
 import database
 from routes import monitors
 
@@ -50,3 +52,72 @@ def test_check_endpoint_rejects_invalid_timeout(client):
     )
 
     assert response.status_code == 422
+
+
+def test_report_outage_accepts_and_hashes_reporter_id(client, monkeypatch):
+    monkeypatch.setattr(
+        monitors,
+        "utc_timestamp",
+        lambda: "2026-07-31T12:00:00Z",
+    )
+
+    response = client.post(
+        "/api/status/example.com/report",
+        json={"reporter_id": "browser-identifier"},
+    )
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "accepted": True,
+        "created_at": "2026-07-31T12:00:00Z",
+    }
+
+    connection = database.get_db()
+    saved_report = connection.execute("""
+        SELECT target, reporter_hash, created_at
+        FROM outage_reports
+        """).fetchone()
+    connection.close()
+
+    assert dict(saved_report) == {
+        "target": "example.com",
+        "reporter_hash": sha256(b"example.com:browser-identifier").hexdigest(),
+        "created_at": "2026-07-31T12:00:00Z",
+    }
+
+
+def test_report_outage_rejects_duplicate_recent_report(client):
+    payload = {"reporter_id": "browser-identifier"}
+
+    first_response = client.post(
+        "/api/status/example.com/report",
+        json=payload,
+    )
+    duplicate_response = client.post(
+        "/api/status/example.com/report",
+        json=payload,
+    )
+
+    assert first_response.status_code == 201
+    assert duplicate_response.status_code == 409
+    assert duplicate_response.json() == {
+        "detail": "You already reported an issue with this website recently."
+    }
+
+
+def test_history_endpoint_returns_empty_24_hour_timeline(client):
+    response = client.get("/api/status/example.com/history")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["target"] == "example.com"
+    assert body["range"] == "24h"
+    assert len(body["points"]) == 24
+    assert all(point["count"] == 0 for point in body["points"])
+    assert body["summary"] == {
+        "reports_in_range": 0,
+        "reports_last_hour": 0,
+        "reports_last_15_minutes": 0,
+        "last_reported_at": None,
+    }
+    assert body["latest_check"] is None
