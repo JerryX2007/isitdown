@@ -25,9 +25,7 @@ def test_record_check_preserves_failed_check_details(db_session):
         "latency": saved_check.latency,
         "status_code": saved_check.status_code,
         "checked_at": (
-            monitors.as_utc(saved_check.checked_at)
-            .isoformat()
-            .replace("+00:00", "Z")
+            monitors.as_utc(saved_check.checked_at).isoformat().replace("+00:00", "Z")
         ),
         "error": saved_check.error,
     } == failed_check

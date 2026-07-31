@@ -1,13 +1,12 @@
 import socket
-from hashlib import sha256
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 
 import pytest
-
-from routes import monitors
-
 from sqlalchemy import func, select
+
 from database_models import CheckHistory, OutageReportRecord
+from routes import monitors
 
 
 def test_health_endpoint(client):
@@ -54,9 +53,7 @@ def test_check_endpoint_records_result(
         "latency": saved_check.latency,
         "status_code": saved_check.status_code,
         "checked_at": (
-            monitors.as_utc(saved_check.checked_at)
-            .isoformat()
-            .replace("+00:00", "Z")
+            monitors.as_utc(saved_check.checked_at).isoformat().replace("+00:00", "Z")
         ),
         "error": saved_check.error,
     } == fake_result
@@ -155,9 +152,7 @@ def test_check_endpoint_returns_400_for_invalid_website(
     assert response.status_code == 400
     assert response.json() == {"detail": expected_detail}
 
-    saved_checks = db_session.scalar(
-        select(func.count()).select_from(CheckHistory)
-    )
+    saved_checks = db_session.scalar(select(func.count()).select_from(CheckHistory))
     assert saved_checks == 0
 
 
@@ -190,9 +185,7 @@ def test_check_endpoint_returns_400_for_private_dns(
         "detail": "Private or local network addresses cannot be checked."
     }
 
-    saved_checks = db_session.scalar(
-        select(func.count()).select_from(CheckHistory)
-    )
+    saved_checks = db_session.scalar(select(func.count()).select_from(CheckHistory))
     assert saved_checks == 0
     assert saved_checks == 0
 
@@ -228,9 +221,10 @@ def test_report_outage_accepts_and_hashes_reporter_id(
 
     assert saved_report is not None
     assert saved_report.target == "example.com"
-    assert saved_report.reporter_hash == sha256(
-        b"example.com:browser-identifier"
-    ).hexdigest()
+    assert (
+        saved_report.reporter_hash
+        == sha256(b"example.com:browser-identifier").hexdigest()
+    )
     assert monitors.as_utc(saved_report.created_at) == fixed_now
 
 
@@ -306,9 +300,7 @@ def test_history_endpoint_returns_populated_seven_day_summary(
     )
     db_session.commit()
 
-    response = client.get(
-        "/api/status/example.com/history?range=7d"
-    )
+    response = client.get("/api/status/example.com/history?range=7d")
 
     assert response.status_code == 200
 
@@ -328,9 +320,7 @@ def test_history_endpoint_returns_populated_seven_day_summary(
     assert latest_check["checked_at"] is not None
 
     assert {
-        key: value
-        for key, value in latest_check.items()
-        if key != "checked_at"
+        key: value for key, value in latest_check.items() if key != "checked_at"
     } == {
         "target": "example.com",
         "status": "issues",
@@ -382,9 +372,7 @@ def test_report_outage_accepts_report_after_rate_limit_expires(
     client,
     db_session,
 ):
-    reporter_hash = sha256(
-        b"example.com:browser-identifier"
-    ).hexdigest()
+    reporter_hash = sha256(b"example.com:browser-identifier").hexdigest()
 
     db_session.add(
         OutageReportRecord(
