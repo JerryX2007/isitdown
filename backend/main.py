@@ -1,8 +1,7 @@
-from config import settings
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from config import settings
 from routes.monitors import router as monitors_router
 
 app = FastAPI(title="Is My Website Down API", version="1.0.0")

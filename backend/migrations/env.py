@@ -2,7 +2,6 @@ from logging.config import fileConfig
 
 from alembic import context
 
-import database_models
 from database import Base, engine
 
 config = context.config
