@@ -3,8 +3,12 @@ __pycache__/
 .vscode/
 *.pyc
 .DS_Store
-monitor.db
+monitor.db*
 
 node_modules/
 dist/
 .pytest_cache/
+
+**/.env
+**/.env.*
+!**/.env.example
