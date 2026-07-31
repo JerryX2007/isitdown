@@ -3,6 +3,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from ipaddress import ip_address
+from re import fullmatch
 from urllib.parse import urlparse
 
 import httpx
@@ -32,13 +33,7 @@ def get_public_addresses(target: str):
 
     for address in addresses:
         parsed_address = ip_address(address)
-        if (
-            parsed_address.is_private
-            or parsed_address.is_loopback
-            or parsed_address.is_link_local
-            or parsed_address.is_reserved
-            or parsed_address.is_multicast
-        ):
+        if not parsed_address.is_global or parsed_address.is_multicast:
             raise HTTPException(
                 status_code=400,
                 detail="Private or local network addresses cannot be checked.",
@@ -53,7 +48,15 @@ def normalize_website(raw_website: str):
     if not value:
         raise HTTPException(status_code=400, detail="Enter a website to check.")
 
-    parsed = urlparse(value if "://" in value else f"https://{value}")
+    try:
+        parsed = urlparse(value if "://" in value else f"https://{value}")
+        custom_port = parsed.port is not None
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid website, such as example.com.",
+        ) from error
+
     scheme = parsed.scheme.lower()
 
     if scheme not in ("http", "https"):
@@ -62,7 +65,7 @@ def normalize_website(raw_website: str):
             detail="Only HTTP and HTTPS websites can be checked.",
         )
 
-    if parsed.username or parsed.password or parsed.port:
+    if parsed.username or parsed.password or custom_port:
         raise HTTPException(
             status_code=400,
             detail="Enter a website without login details or a custom port.",
@@ -80,6 +83,16 @@ def normalize_website(raw_website: str):
         raise HTTPException(
             status_code=400, detail="Invalid website address."
         ) from error
+
+    labels = target.split(".")
+    if len(target) > 253 or any(
+        fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) is None
+        for label in labels
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a valid website, such as example.com.",
+        )
 
     if target == "localhost" or target.endswith(".local") or "." not in target:
         raise HTTPException(
@@ -117,7 +130,8 @@ def check_target(website: str, timeout: float):
     last_error = "The website did not respond."
 
     with httpx.Client(
-        follow_redirects=True,
+        follow_redirects=False,
+        trust_env=False,
         timeout=httpx.Timeout(timeout),
         headers={
             "User-Agent": "WebsiteStatusChecker/1.0",
