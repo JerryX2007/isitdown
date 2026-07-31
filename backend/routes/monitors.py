@@ -1,22 +1,26 @@
-from fastapi import APIRouter, HTTPException, Query
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
-from hashlib import sha256
-from ipaddress import ip_address
 import socket
 import time
+from datetime import datetime, timedelta, timezone
+from hashlib import sha256
+from ipaddress import ip_address
+from urllib.parse import urlparse
+
 import httpx
+from fastapi import APIRouter, HTTPException, Query
 
 from database import get_db
 from models import Monitor, OutageReport
 
 router = APIRouter(prefix="/api", tags=["website status"])
 
+
 def utc_now():
     return datetime.now(timezone.utc)
 
+
 def utc_timestamp():
     return utc_now().isoformat().replace("+00:00", "Z")
+
 
 def get_public_addresses(target: str):
     try:
@@ -41,6 +45,7 @@ def get_public_addresses(target: str):
             )
 
     return list(addresses)
+
 
 def normalize_website(raw_website: str):
     value = raw_website.strip()
@@ -72,7 +77,9 @@ def normalize_website(raw_website: str):
     try:
         target = parsed.hostname.encode("idna").decode("ascii").lower().rstrip(".")
     except UnicodeError as error:
-        raise HTTPException(status_code=400, detail="Invalid website address.") from error
+        raise HTTPException(
+            status_code=400, detail="Invalid website address."
+        ) from error
 
     if target == "localhost" or target.endswith(".local") or "." not in target:
         raise HTTPException(
@@ -85,6 +92,7 @@ def normalize_website(raw_website: str):
         "scheme": scheme,
         "url": f"{scheme}://{target}",
     }
+
 
 def check_target(website: str, timeout: float):
     normalized = normalize_website(website)
@@ -149,6 +157,7 @@ def check_target(website: str, timeout: float):
         "error": last_error,
     }
 
+
 def record_check(result: dict):
     connection = get_db()
     connection.execute(
@@ -169,6 +178,7 @@ def record_check(result: dict):
     connection.commit()
     connection.close()
 
+
 def create_empty_timeline(selected_range: str):
     now = utc_now()
 
@@ -185,26 +195,25 @@ def create_empty_timeline(selected_range: str):
     end = now.replace(minute=0, second=0, microsecond=0)
     return [
         {
-            "key": (end - timedelta(hours=23 - index)).strftime(
-                "%Y-%m-%dT%H:00:00Z"
-            ),
+            "key": (end - timedelta(hours=23 - index)).strftime("%Y-%m-%dT%H:00:00Z"),
             "count": 0,
         }
         for index in range(24)
     ]
 
-#GET ENDPOINTS
+
+# GET ENDPOINTS
+
 
 @router.get("/status/{target}/history")
-def get_outage_history(target: str, selected_range: str = Query(default="24h", alias="range", pattern="^(24h|7d)$")):
+def get_outage_history(
+    target: str,
+    selected_range: str = Query(default="24h", alias="range", pattern="^(24h|7d)$"),
+):
     normalized = normalize_website(target)
     clean_target = normalized["target"]
     timeline = create_empty_timeline(selected_range)
-    bucket_format = (
-        "%Y-%m-%d"
-        if selected_range == "7d"
-        else "%Y-%m-%dT%H:00:00Z"
-    )
+    bucket_format = "%Y-%m-%d" if selected_range == "7d" else "%Y-%m-%dT%H:00:00Z"
     since = "-7 days" if selected_range == "7d" else "-24 hours"
 
     connection = get_db()
@@ -272,13 +281,16 @@ def get_outage_history(target: str, selected_range: str = Query(default="24h", a
         "latest_check": dict(latest_check_row) if latest_check_row else None,
     }
 
-#POST ENDPOINTS
+
+# POST ENDPOINTS
+
 
 @router.post("/check")
 def check_website(request: Monitor):
     result = check_target(request.website, request.timeout)
     record_check(result)
     return result
+
 
 @router.post("/status/{target}/report", status_code=201)
 def report_outage(target: str, report: OutageReport):
