@@ -1,8 +1,8 @@
 import logging
 import time
 from uuid import uuid4
-import sentry_sdk
 
+import sentry_sdk
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 
