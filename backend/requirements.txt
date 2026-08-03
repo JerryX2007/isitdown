@@ -5,3 +5,4 @@ pydantic-settings==2.14.2
 SQLAlchemy==2.0.51
 alembic==1.18.5
 psycopg[binary]==3.3.4
+sentry-sdk[fastapi]==2.66.1
