@@ -1,6 +1,7 @@
 import logging
 import time
 from uuid import uuid4
+import sentry_sdk
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +9,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import settings
 from logging_config import configure_logging
 from routes.monitors import router as monitors_router
+
+if settings.sentry_dsn:
+    sentry_sdk.init(
+        dsn=settings.sentry_dsn,
+        environment=settings.app_env,
+        send_default_pii=False,
+        traces_sample_rate=0.0,
+    )
 
 configure_logging()
 request_logger = logging.getLogger("api.request")
